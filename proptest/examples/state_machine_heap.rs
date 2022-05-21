@@ -11,6 +11,7 @@
 extern crate proptest;
 
 use std::cmp;
+use std::collections::BinaryHeap;
 
 /// A hand-rolled implementation of a binary heap, like
 /// https://doc.rust-lang.org/stable/std/collections/struct.BinaryHeap.html,
@@ -107,13 +108,109 @@ enum Transition {
     Push(i32),
 }
 
-struct HeapStateMachine;
+trait SystemUnderTest<T> {
+    fn pop(&mut self) -> Option<T>;
+    fn push(&mut self, value: T);
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool;
+}
+
+impl SystemUnderTest<i32> for () {
+    fn pop(&mut self) -> Option<i32> {
+        None
+    }
+
+    fn push(&mut self, _value: i32) {}
+
+    fn len(&self) -> usize {
+        0
+    }
+
+    fn is_empty(&self) -> bool {
+        false
+    }
+}
+
+impl SystemUnderTest<i32> for MyHeap<i32> {
+    fn pop(&mut self) -> Option<i32> {
+        // switch to self.pop() to fix the bug
+        self.pop_wrong()
+    }
+
+    fn push(&mut self, value: i32) {
+        self.push(value)
+    }
+
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.is_empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MyModel<T> {
+    sut: T,
+    state: BinaryHeap<i32>,
+    popped_sut: Option<i32>,
+    len_sut: usize,
+    empty_sut: bool,
+    popped_state: Option<i32>,
+    len_state: usize,
+    empty_state: bool,
+}
+
+impl<T: SystemUnderTest<i32>> MyModel<T> {
+    fn new(sut: T) -> Self {
+        Self {
+            sut,
+            state: Default::default(),
+            popped_sut: None,
+            len_sut: 0,
+            empty_sut: false,
+            popped_state: None,
+            len_state: 0,
+            empty_state: false,
+        }
+    }
+
+    fn transition(mut self, transition: &Transition) -> Self {
+        match transition {
+            Transition::Pop => {
+                self.popped_sut = self.sut.pop();
+                self.popped_state = self.state.pop();
+            }
+            Transition::Push(value) => {
+                self.sut.push(*value);
+                self.state.push(*value);
+            }
+        }
+        self.len_state = self.state.len();
+        self.empty_state = self.state.is_empty();
+        self.len_sut = self.sut.len();
+        self.empty_sut = self.sut.is_empty();
+
+        self
+    }
+
+    fn invariants(&self) {
+        assert_eq!(self.popped_state, self.popped_sut);
+        assert_eq!(self.len_state, self.len_sut);
+        assert_eq!(self.empty_state, self.empty_sut);
+        assert_eq!(self.len_sut == 0, self.empty_sut);
+    }
+}
+
+struct HeapStateMachine {}
+
 impl AbstractStateMachine for HeapStateMachine {
-    type State = Vec<i32>;
+    type State = MyModel<()>;
     type Transition = Transition;
 
     fn init_state() -> BoxedStrategy<Self::State> {
-        Just(vec![]).boxed()
+        Just(MyModel::new(())).boxed()
     }
 
     fn transitions(_state: &Self::State) -> BoxedStrategy<Self::Transition> {
@@ -126,67 +223,33 @@ impl AbstractStateMachine for HeapStateMachine {
     }
 
     fn apply_abstract(
-        mut state: Self::State,
+        state: Self::State,
         transition: &Self::Transition,
     ) -> Self::State {
-        match transition {
-            Transition::Pop => {
-                state.pop();
-                ()
-            }
-            Transition::Push(value) => state.push(*value),
-        }
-        state
+        state.transition(transition)
     }
 }
 
 struct MyHeapTest;
 impl StateMachineTest for MyHeapTest {
-    type ConcreteState = MyHeap<i32>;
+    type ConcreteState = MyModel<MyHeap<i32>>;
     type Abstract = HeapStateMachine;
 
     fn init_test(
         _initial_state: <Self::Abstract as AbstractStateMachine>::State,
     ) -> Self::ConcreteState {
-        MyHeap::new()
+        MyModel::new(MyHeap::new())
     }
 
     fn apply_concrete(
-        mut state: Self::ConcreteState,
+        state: Self::ConcreteState,
         transition: Transition,
     ) -> Self::ConcreteState {
-        match transition {
-            Transition::Pop => {
-                let was_empty = state.is_empty();
-                // We use the broken implementation of pop, which should be
-                // discovered by the test
-                let result = state.pop_wrong();
-                // A post-condition
-                match result {
-                    Some(value) => {
-                        assert!(!was_empty);
-                        // The heap must not contain any value which was
-                        // greater than the "maximum" we were just given.
-                        for in_heap in state.iter() {
-                            assert!(
-                                value >= *in_heap,
-                                "Popped value {:?}, which was less \
-                                    than {:?} still in the heap",
-                                value,
-                                in_heap
-                            );
-                        }
-                    }
-                    None => assert!(was_empty),
-                }
-            }
-            Transition::Push(value) => state.push(value),
-        }
-        state
+        state.transition(&transition)
     }
 
     fn invariants(state: &Self::ConcreteState) {
-        assert_eq!(0 == state.len(), state.is_empty());
+        state.invariants()
     }
 }
 
@@ -213,7 +276,7 @@ prop_state_machine! {
         .. Config::default()
     })]
     #[test]
-    fn run_with_macro(sequential 1..20 => MyHeapTest);
+    fn run_with_macro(sequential 1..20 => HeapStateMachine);
 }
 
 fn main() {
