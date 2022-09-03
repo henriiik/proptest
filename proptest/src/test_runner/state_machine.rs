@@ -27,11 +27,15 @@ pub trait StateMachineTest {
     /// Apply a transition in the concrete state.
     fn apply_concrete(
         state: Self::ConcreteState,
-        transition: <Self::Abstract as AbstractStateMachine>::Transition,
+        transition: &<Self::Abstract as AbstractStateMachine>::Transition,
     ) -> Self::ConcreteState;
 
     /// Check some invariant on the concrete state after every transition.
-    fn invariants(#[allow(unused_variables)] state: &Self::ConcreteState) {}
+    fn invariants(
+        #[allow(unused_variables)] state: &Self::ConcreteState,
+        #[allow(unused_variables)] transition: &<Self::Abstract as AbstractStateMachine>::Transition,
+    ) {
+    }
 
     /// Run the test sequentially.
     fn test_sequential(
@@ -40,40 +44,40 @@ pub trait StateMachineTest {
     ) {
         let mut state = Self::init_test(initial_state);
         for transition in transitions.into_iter() {
-            state = Self::apply_concrete(state, transition);
-            Self::invariants(&state);
+            state = Self::apply_concrete(state, &transition);
+            Self::invariants(&state, &transition);
         }
     }
 }
 
 /// This macro helps to turn a state machine test implementation into a runnable
 /// test. The macro expects a function header whose arguments follow a special
-/// syntax rules: First, we declare if we want to apply the state machine 
-/// transitions sequentially or concurrently (currently, only the `sequential` 
+/// syntax rules: First, we declare if we want to apply the state machine
+/// transitions sequentially or concurrently (currently, only the `sequential`
 /// is supported). Next, we give a range of how many transitions to generate,
-/// followed by `=>` and finally, an identifier that must implement 
+/// followed by `=>` and finally, an identifier that must implement
 /// `StateMachineTest`.
-/// 
+///
 /// ## Example
-/// 
+///
 /// ```rust,ignore
 /// struct MyTest;
-/// 
+///
 /// impl StateMachineTest for MyTest {}
-/// 
+///
 /// prop_state_machine! {
 ///     #[test]
 ///     fn run_with_macro(sequential 1..20 => MyTest);
 /// }
 /// ```
-/// 
+///
 /// This example will expand to:
-/// 
+///
 /// ```rust,ignore
 /// struct MyTest;
-/// 
+///
 /// impl StateMachineTest for MyTest {}
-/// 
+///
 /// proptest! {
 ///     #[test]
 ///     fn run_with_macro(
