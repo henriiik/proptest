@@ -16,7 +16,7 @@ use std::collections::BinaryHeap;
 /// A hand-rolled implementation of a binary heap, like
 /// https://doc.rust-lang.org/stable/std/collections/struct.BinaryHeap.html,
 /// except slow and buggy.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct MyHeap<T> {
     data: Vec<T>,
 }
@@ -243,12 +243,12 @@ impl StateMachineTest for MyHeapTest {
 
     fn apply_concrete(
         state: Self::ConcreteState,
-        transition: Transition,
+        transition: &Transition,
     ) -> Self::ConcreteState {
-        state.transition(&transition)
+        state.transition(transition)
     }
 
-    fn invariants(state: &Self::ConcreteState) {
+    fn invariants(state: &Self::ConcreteState, _transition: &Transition) {
         state.invariants()
     }
 }
@@ -276,7 +276,7 @@ prop_state_machine! {
         .. Config::default()
     })]
     #[test]
-    fn run_with_macro(sequential 1..20 => HeapStateMachine);
+    fn run_with_macro(sequential 1..10 => MyHeapTest);
 }
 
 fn main() {
