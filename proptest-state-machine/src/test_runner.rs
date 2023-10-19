@@ -10,7 +10,6 @@
 //! Test declaration helpers and runners for abstract state machine testing.
 
 use crate::strategy::ReferenceStateMachine;
-use proptest::std_facade::Vec;
 use proptest::test_runner::Config;
 
 /// State machine test that relies on a reference state machine model
@@ -69,7 +68,7 @@ pub trait StateMachineTest {
     fn test_sequential(
         config: Config,
         mut ref_state: <Self::Reference as ReferenceStateMachine>::State,
-        transitions: Vec<
+        transitions: crate::ObservedVec<
             <Self::Reference as ReferenceStateMachine>::Transition,
         >,
     ) {

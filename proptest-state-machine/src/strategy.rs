@@ -9,6 +9,9 @@
 
 //! Strategies used for abstract state machine testing.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
 use proptest::bits::{BitSetLike, VarBitSet};
 use proptest::collection::SizeRange;
 use proptest::num::sample_uniform_incl;
@@ -17,6 +20,10 @@ use proptest::std_facade::Vec;
 use proptest::strategy::BoxedStrategy;
 use proptest::strategy::{NewTree, Strategy, ValueTree};
 use proptest::test_runner::TestRunner;
+
+mod observed_vec;
+
+pub use observed_vec::ObservedVec;
 
 /// This trait is used to model system under test as an abstract state machine.
 ///
@@ -118,14 +125,15 @@ pub trait ReferenceStateMachine {
 /// The shrinking strategy is to iteratively apply `Shrink::InitialState`,
 /// `Shrink::DeleteTransition` and `Shrink::Transition`.
 ///
-/// 1. We start by trying to delete transitions from the back of the list, until
-///    we can do so no further (the list has reached the `min_size`).
-///    We start from the back, because it's less likely to affect the state
+/// 1. We start by trying to delete transitions from the back of the list that
+///    were never seen by the test, because it's less likely to affect the state
 ///    machine's pre-conditions, if any.
-/// 2. Then, we again iteratively attempt to shrink the individual transitions,
+/// 2. Then, we keep trying to delete transitions from the back of the list, until
+///    we can do so no further (the list has reached the `min_size`).
+/// 3. Then, we again iteratively attempt to shrink the individual transitions,
 ///    but this time starting from the front of the list - i.e. from the first
 ///    transition to be applied.
-/// 3. Finally, we try to shrink the initial state until it's not possible to
+/// 4. Finally, we try to shrink the initial state until it's not possible to
 ///    shrink it any further.
 ///
 /// For `complicate`, we attempt to undo the last shrink operation, if there was
@@ -162,7 +170,7 @@ impl<
         StateStrategy::Tree,
         TransitionStrategy::Tree,
     >;
-    type Value = (State, Vec<Transition>);
+    type Value = (State, ObservedVec<Transition>);
 
     fn new_tree(&self, runner: &mut TestRunner) -> NewTree<Self> {
         // Generate the initial state value tree
@@ -211,19 +219,22 @@ impl<
             shrinkable_transitions,
             min_size,
             max_ix,
-            // On a failure, we start by shrinking transitions from the back
-            // which is less likely to invalidate pre-conditions
-            shrink: Shrink::DeleteTransition(max_ix),
+            // On a failure, we start by removing transitions from the back that
+            // were never seen by the test
+            shrink: Shrink::DeleteUnseenTransitions(vec![]),
             last_shrink: None,
+            seen_transitions_counter: Default::default(),
         })
     }
 }
 
 /// A shrinking operation
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Shrink {
     /// Shrink the initial state
     InitialState,
+    /// Delete transition that were not seen at given indexes
+    DeleteUnseenTransitions(Vec<usize>),
     /// Delete a transition at given index
     DeleteTransition(usize),
     /// Shrink a transition at given index
@@ -279,6 +290,9 @@ pub struct SequentialValueTree<
     shrink: Shrink,
     /// The last applied shrink operation, if any
     last_shrink: Option<Shrink>,
+    /// The number of transitions that were or will be seen by the test runner.
+    /// Resets on every call to `simplify` or `complicate`
+    seen_transitions_counter: Arc<AtomicUsize>,
 }
 
 impl<
@@ -292,6 +306,49 @@ impl<
     /// Try to apply the next `self.shrink`. Returns `true` if a shrink has been
     /// applied.
     fn try_simplify(&mut self) -> bool {
+        if let DeleteUnseenTransitions(prev_deleted_ixs) = &mut self.shrink {
+            let seen_count =
+                self.seen_transitions_counter.load(Ordering::SeqCst);
+
+            let included_count = self.included_transitions.count();
+
+            if seen_count >= included_count {
+                // the test runner saw all the transitions and failed on the
+                // last one, so we cant delete any transitions from the end.
+            } else {
+                // the test runner did not see all the transitions so we can
+                // delete the transitions that were not seen and thus not executed.
+
+                let mut deleted = vec![];
+                let mut kept_count = 0;
+                let mut last_seen_ix = 0;
+                for ix in 0..self.transitions.len() {
+                    if self.included_transitions.test(ix) {
+                        // transition at ix was part of test
+
+                        if kept_count < seen_count || kept_count < self.min_size
+                        {
+                            // transition at xi was seen by the test or we are
+                            // still below minimum size for the test
+                            kept_count += 1;
+                            last_seen_ix = ix;
+                        } else {
+                            // transition at ix was never seen
+                            self.included_transitions.clear(ix);
+                            self.shrinkable_transitions.clear(ix);
+                            deleted.push(ix);
+                        }
+                    }
+                }
+
+                deleted.append(prev_deleted_ixs);
+
+                self.last_shrink = Some(DeleteUnseenTransitions(deleted));
+                self.shrink = DeleteTransition(last_seen_ix);
+                return true;
+            }
+        }
+
         if let DeleteTransition(ix) = self.shrink {
             if self.included_transitions.count() == self.min_size {
                 // Can't delete any more transitions, move on to shrinking them
@@ -300,7 +357,7 @@ impl<
                 // Delete the index from the included transitions
                 self.included_transitions.clear(ix);
 
-                self.last_shrink = Some(self.shrink);
+                self.last_shrink = Some(self.shrink.clone());
                 self.shrink = if ix == 0 {
                     // Reached the beginning of the list, move on to shrinking
                     Transition(0)
@@ -340,7 +397,7 @@ impl<
                 // This transition is already simplified and rejected
                 self.shrink = self.next_shrink_transition(ix);
             } else if self.transitions[ix].simplify() {
-                self.last_shrink = Some(self.shrink);
+                self.last_shrink = Some(self.shrink.clone());
                 if self.check_acceptable(Some(ix)) {
                     self.acceptable_transitions[ix] =
                         (Accepted, self.transitions[ix].current());
@@ -449,7 +506,7 @@ impl<
     /// yet been rejected.
     fn can_simplify(&self) -> bool {
         self.is_initial_state_shrinkable ||
-             // If there are some transitions whose shrinking has not yet been 
+             // If there are some transitions whose shrinking has not yet been
              // rejected, we can try to shrink them further
              !self
                 .acceptable_transitions
@@ -490,39 +547,70 @@ impl<
         TransitionValueTree,
     >
 {
-    type Value = (State, Vec<Transition>);
+    type Value = (State, ObservedVec<Transition>);
 
     fn current(&self) -> Self::Value {
         (
             self.last_valid_initial_state.clone(),
-            // The current included acceptable transitions
-            self.get_included_acceptable_transitions(None),
+            ObservedVec::new(
+                self.seen_transitions_counter.clone(),
+                // The current included acceptable transitions
+                self.get_included_acceptable_transitions(None),
+            ),
         )
     }
 
     fn simplify(&mut self) -> bool {
-        if self.can_simplify() {
+        let was_simplified = if self.can_simplify() {
             self.try_simplify()
+        } else if let Some(Transition(ix)) = self.last_shrink {
+            self.try_to_find_acceptable_transition(ix)
         } else {
-            if let Some(Transition(ix)) = self.last_shrink {
-                return self.try_to_find_acceptable_transition(ix);
-            }
             false
-        }
+        };
+
+        // reset seen transactions counter for next run
+        self.seen_transitions_counter = Default::default();
+
+        was_simplified
     }
 
     fn complicate(&mut self) -> bool {
-        match self.last_shrink {
+        // reset seen transactions counter for next run
+        self.seen_transitions_counter = Default::default();
+
+        match &self.last_shrink {
             None => false,
+            Some(DeleteUnseenTransitions(ixs)) => {
+                if ixs.is_empty() {
+                    self.last_shrink = None;
+                    return false;
+                }
+
+                let len = ixs.len();
+                // ixs.split_at panics if we pass a `mid` that is > `len`
+                let mid = len.min((len / 2) + 1);
+                let (undo_ixs, ixs) = ixs.split_at(mid);
+
+                // Undo half of the items we deleted.
+                for ix in undo_ixs {
+                    self.included_transitions.set(*ix);
+                    self.shrinkable_transitions.set(*ix);
+                }
+
+                self.last_shrink = Some(DeleteUnseenTransitions(ixs.to_vec()));
+                true
+            }
             Some(DeleteTransition(ix)) => {
                 // Undo the last item we deleted. Can't complicate any further,
                 // so unset prev_shrink.
-                self.included_transitions.set(ix);
-                self.shrinkable_transitions.set(ix);
+                self.included_transitions.set(*ix);
+                self.shrinkable_transitions.set(*ix);
                 self.last_shrink = None;
                 true
             }
             Some(Transition(ix)) => {
+                let ix = *ix;
                 if self.transitions[ix].complicate() {
                     if self.check_acceptable(Some(ix)) {
                         self.acceptable_transitions[ix] =
@@ -575,7 +663,7 @@ mod test {
     ///
     /// This constant can be determined from the test
     /// `number_of_sequential_value_tree_simplifications`.
-    const SIMPLIFICATIONS: usize = 699;
+    const SIMPLIFICATIONS: usize = 700;
     /// Number of transitions in the [`deterministic_sequential_value_tree`].
     const TRANSITIONS: usize = 32;
 
@@ -668,6 +756,79 @@ mod test {
         }
     }
 
+    proptest! {
+        /// Test the initial simplifications of the `SequentialValueTree` produced
+        /// by `deterministic_sequential_value_tree`.
+        ///
+        /// We want to make sure that we initially remove the transitions that
+        /// where not seen, but still respect minimum test size.
+        #[test]
+        fn test_value_tree_initial_simplification(
+            min in 1usize..100,
+            len in 10usize..100,
+        ) {
+            test_value_tree_initial_simplification_aux(min, len)
+        }
+    }
+
+    fn test_value_tree_initial_simplification_aux(min: usize, len: usize) {
+        let sequential =
+            <HeapStateMachine as ReferenceStateMachine>::sequential_strategy(
+                min..(min + len),
+            );
+
+        let mut runner = TestRunner::deterministic();
+        let mut value_tree = sequential.new_tree(&mut runner).unwrap();
+
+        let (_, transitions) = value_tree.current();
+
+        let num_seen = transitions.len() / 2;
+
+        let mut seen_before_complication =
+            transitions.into_iter().take(num_seen).collect::<Vec<_>>();
+
+        assert!(value_tree.simplify());
+
+        let (_, transitions) = value_tree.current();
+
+        let seen_after_first_complication =
+            transitions.into_iter().collect::<Vec<_>>();
+
+        if num_seen >= min {
+            assert_eq!(
+                seen_before_complication, seen_after_first_complication,
+                "only seen transitions should be present after first simplification"
+            );
+        } else {
+            assert_eq!(
+                min,
+                seen_after_first_complication.len(),
+                "the min number of transitions should be present after first simplification"
+            );
+        }
+
+        assert!(value_tree.simplify());
+
+        let (_, transitions) = value_tree.current();
+        let seen_after_second_complication =
+            transitions.into_iter().collect::<Vec<_>>();
+
+        if num_seen > min {
+            seen_before_complication.pop();
+
+            assert_eq!(
+                seen_before_complication, seen_after_second_complication,
+                "second complication should start to delete transactions one by one"
+            );
+        } else {
+            assert_eq!(
+                min,
+                seen_after_second_complication.len(),
+                "the min number of transitions should be present after second simplification"
+            );
+        }
+    }
+
     /// The following is a definition of an reference state machine used for the
     /// tests.
     mod heap_state_machine {
@@ -690,7 +851,7 @@ mod test {
 
         pub type TestState = Vec<i32>;
 
-        #[derive(Clone, Debug)]
+        #[derive(Clone, Debug, PartialEq)]
         pub enum TestTransition {
             PopNonEmpty,
             PopEmpty,
