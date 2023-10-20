@@ -552,10 +552,16 @@ impl<
     type Value = (State, ObservedVec<Transition>);
 
     fn current(&self) -> Self::Value {
+        if Arc::strong_count(&self.seen_transitions_counter) > 1 {
+            panic!("current must only be called once between calls to simplify or complicate");
+        } else if self.seen_transitions_counter.load(Ordering::SeqCst) > 0 {
+            panic!("simplify or complicate must be called between calls to current");
+        }
+
         (
             self.last_valid_initial_state.clone(),
             ObservedVec::new(
-                self.seen_transitions_counter.clone(),
+                Arc::clone(&self.seen_transitions_counter),
                 // The current included acceptable transitions
                 self.get_included_acceptable_transitions(None),
             ),
@@ -819,7 +825,8 @@ mod test {
             seen_before_complication.pop();
 
             assert_eq!(
-                seen_before_complication, seen_after_second_complication,
+                seen_before_complication,
+                seen_after_second_complication,
                 "second complication should start to delete transactions one by one"
             );
         } else {
@@ -829,6 +836,39 @@ mod test {
                 "the min number of transitions should be present after second simplification"
             );
         }
+    }
+
+    #[test]
+    fn test_multiple_calls_to_current_without_drop() {
+        let result = std::panic::catch_unwind(|| {
+            let value_tree = deterministic_sequential_value_tree();
+            let (_, _transitions1) = value_tree.current();
+            let (_, _transitions2) = value_tree.current();
+        })
+        .expect_err("should panic");
+
+        let s =
+            "current must only be called once between calls to simplify or complicate";
+        assert_eq!(result.downcast_ref::<&str>(), Some(&s));
+    }
+
+    #[test]
+    fn test_multiple_calls_to_current_with_drop() {
+        let result = std::panic::catch_unwind(|| {
+            let value_tree = deterministic_sequential_value_tree();
+
+            let (_, transitions1) = value_tree.current();
+            let mut iter = transitions1.into_iter();
+            iter.next();
+            drop(iter);
+
+            let _transitions2 = value_tree.current();
+        })
+        .expect_err("should panic");
+
+        let s =
+            "simplify or complicate must be called between calls to current";
+        assert_eq!(result.downcast_ref::<&str>(), Some(&s));
     }
 
     /// The following is a definition of an reference state machine used for the
