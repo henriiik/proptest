@@ -22,7 +22,7 @@ use proptest::std_facade::Vec;
 /// Used as in the [`proptest::strategy::ValueTree`] impl for
 /// [`super::SequentialValueTree`] to communicate back which transitions were not
 /// seen by the test runner and thus are safe to delete.
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct ObservedVec<T> {
     seen_counter: Arc<AtomicUsize>,
     transitions: Vec<T>,
@@ -108,7 +108,7 @@ mod tests {
     fn test_fmt_aux(vec: Vec<i32>) {
         let transitions = ObservedVec {
             seen_counter: Default::default(),
-            transitions: vec.clone().into_iter().rev().collect(),
+            transitions: vec.clone(),
         };
 
         assert_eq!(format!("{transitions:?}",), format!("{vec:?}",));
@@ -127,7 +127,7 @@ mod tests {
         let seen_counter = Default::default();
         let transitions = ObservedVec {
             seen_counter: Arc::clone(&seen_counter),
-            transitions: vec.clone().into_iter().rev().collect(),
+            transitions: vec.clone(),
         };
 
         let len = vec.len();
